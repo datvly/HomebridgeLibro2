@@ -141,6 +141,26 @@ function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Name a service so Apple Home actually shows the label.
+//
+// Setting only `Name` is not enough once an accessory carries more than one
+// service of the same type: Home renders `ConfiguredName`, and without it every
+// tile falls back to the accessory name — so N switches all display identically
+// and there is no way to tell which is which.
+function setServiceName(hap, service, name) {
+  service.setCharacteristic(hap.Characteristic.Name, name);
+  const Configured = hap.Characteristic.ConfiguredName;
+  if (!Configured) return; // older HAP: Name is the best available
+  try {
+    if (service.testCharacteristic && !service.testCharacteristic(Configured)) {
+      service.addOptionalCharacteristic(Configured);
+    }
+    service.setCharacteristic(Configured, name);
+  } catch (err) {
+    // Never let a cosmetic naming failure abort accessory setup.
+  }
+}
+
 class PetLibroPlatform {
   constructor(log, config, api) {
     this.log = log;
@@ -617,15 +637,39 @@ class PetLibroWetFeeder extends PetLibroFeeder {
 
     const hap = this.platform.api.hap;
     const rotationEnabled = this.config.enableTrayRotation !== false;
+    const traySwitches = this.config.exposeTraySwitches !== false;
+
+    // Inherited primary switch = "feed the default tray". Kept as the service
+    // without a subtype so Siri and existing automations still have one obvious
+    // target on this accessory.
+    setServiceName(hap, this.switchService, `Feed Tray ${this.plate}`);
+
+    // One momentary switch per tray, so a specific slot can be served directly
+    // instead of stepping the tray blind and guessing where it landed.
+    this.serveServices = [];
+    for (let plate = 1; plate <= WET_FEEDER_PLATE_COUNT; plate++) {
+      const subtype = `serve-${plate}`;
+      const existing = this.accessory.getServiceById(hap.Service.Switch, subtype);
+
+      if (!traySwitches) {
+        if (existing) this.accessory.removeService(existing);
+        continue;
+      }
+
+      const svc = existing
+        || this.accessory.addService(hap.Service.Switch, `Tray ${plate}`, subtype);
+      setServiceName(hap, svc, `Tray ${plate}`);
+      svc.getCharacteristic(hap.Characteristic.On)
+        .onGet(async () => false)
+        .onSet((value) => this.setServeTray(plate, value));
+      this.serveServices.push(svc);
+    }
 
     if (rotationEnabled) {
-      // Second Switch on the same accessory, distinguished by subtype so it
-      // does not collide with the inherited feed switch.
-      this.rotateService = this.accessory.getServiceById(hap.Service.Switch, 'rotate')
-        || this.accessory.addService(hap.Service.Switch, `${this.name} Rotate Tray`, 'rotate');
-
-      this.rotateService.setCharacteristic(hap.Characteristic.Name, `${this.name} Rotate Tray`);
-
+      const subtype = 'rotate';
+      this.rotateService = this.accessory.getServiceById(hap.Service.Switch, subtype)
+        || this.accessory.addService(hap.Service.Switch, 'Rotate Tray', subtype);
+      setServiceName(hap, this.rotateService, 'Rotate Tray');
       this.rotateService.getCharacteristic(hap.Characteristic.On)
         .onGet(async () => false)
         .onSet(this.setRotate.bind(this));
@@ -636,7 +680,50 @@ class PetLibroWetFeeder extends PetLibroFeeder {
       if (stale) this.accessory.removeService(stale);
     }
 
-    this.log.info(`  serving plate ${this.plate}, tray rotation ${rotationEnabled ? 'enabled' : 'disabled'}`);
+    this.log.info(`  default tray ${this.plate}, per-tray switches ${traySwitches ? 'enabled' : 'disabled'}, rotation ${rotationEnabled ? 'enabled' : 'disabled'}`);
+  }
+
+  // Serve one specific tray. Momentary, mirroring the feed switch.
+  async setServeTray(plate, value) {
+    if (!value) return;
+
+    const hap = this.platform.api.hap;
+    const svc = this.accessory.getServiceById(hap.Service.Switch, `serve-${plate}`);
+    const reset = (ms) => setTimeout(() => {
+      if (svc) svc.getCharacteristic(hap.Characteristic.On).updateValue(false);
+    }, ms);
+
+    if (this.device && this.device.online === false) {
+      this.log.warn(`[${this.name}] Device reports offline; refusing to serve tray ${plate}`);
+      reset(100);
+      if (hap.HapStatusError && hap.HAPStatus) {
+        throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+      }
+      throw new Error('Device offline');
+    }
+
+    try {
+      await this.serveTray(plate);
+      this.log(`[${this.name}] Served tray ${plate}`);
+      reset(1000);
+    } catch (error) {
+      this.log.error(`[${this.name}] Failed to serve tray ${plate}:`, error.message);
+      reset(100);
+    }
+  }
+
+  // Open the lid on a given tray. Re-serving an already-served tray is allowed
+  // by the server (verified: code 0), so no guard here.
+  async serveTray(plate) {
+    if (!this.deviceId) {
+      throw new Error('Device ID not found - cannot send feed command');
+    }
+    const response = await this.platform.apiPost('/device/wetFeedingPlan/manualFeedNow', {
+      deviceSn: this.deviceId,
+      plate,
+      requestId: this.generateRequestId()
+    }, { timeout: 15000 });
+    assertApiOk(response, `Serve tray ${plate}`);
   }
 
   get deviceLabel() {
@@ -650,16 +737,9 @@ class PetLibroWetFeeder extends PetLibroFeeder {
 
     // `portions` is a dry-feeder concept (auger revolutions) and has no
     // meaning here; the tray slot is the unit of service.
-    this.log(`[${this.name}] Sending wet feed command (plate ${this.plate})`);
-
-    const response = await this.platform.apiPost('/device/wetFeedingPlan/manualFeedNow', {
-      deviceSn: this.deviceId,
-      plate: this.plate,
-      requestId: this.generateRequestId()
-    }, { timeout: 15000 });
-
-    assertApiOk(response, 'Wet feed command');
-    this.log(`[${this.name}] Wet feeding triggered successfully (plate ${this.plate})`);
+    this.log(`[${this.name}] Sending wet feed command (default tray ${this.plate})`);
+    await this.serveTray(this.plate);
+    this.log(`[${this.name}] Wet feeding triggered successfully (tray ${this.plate})`);
   }
 
   // Advance the tray one slot. Momentary, like the feed switch.

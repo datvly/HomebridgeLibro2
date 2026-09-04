@@ -12,14 +12,19 @@ Adds support for the PLAF109 "Polar" wet food feeder (Wave C of the device-expan
 
 ### Added
 - **`DEVICE_TYPE.WET_FEEDER` and the `PetLibroWetFeeder` class.** Detection keys on `productIdentifier === 'PLAF109'` with a `productName` containing "Polar" as fallback. Deliberately not serial-prefix based: Polar and Granary serials share the same `AF` family code, so a prefix check cannot separate them.
-- **Standalone tray rotation as a second Switch** on the wet-feeder accessory (subtype `rotate`, labelled "<name> Rotate Tray"). Momentary, like the feed switch. This is not reachable from the official app, which only rotates as a side effect of feeding.
-- **`wetPlate` config** (integer 1-3, default 1) — which tray slot the feed switch serves. Out-of-range and non-numeric values fall back to 1.
+- **A momentary switch per tray** (`Tray 1` / `Tray 2` / `Tray 3`, subtypes `serve-N`) so a specific slot can be served directly. Stepping the tray blind and guessing where it landed was the only option otherwise, since the API exposes no absolute "go to tray N" call.
+- **Standalone tray rotation as a Switch** (subtype `rotate`, labelled `Rotate Tray`). Momentary. Advances one slot without opening the lid — not reachable from the official app, which only rotates as a side effect of feeding.
+- **`config.schema.json`**, which the repo previously lacked entirely. Every existing option (`email`, `password`, `country`, `timezone`, `portions`, `fountainPollingInterval`, `debugDeviceDump`, `apiEndpoint`) plus the three new ones are now editable in Config UI X instead of by hand-editing `config.json`. The default tray is a dropdown. Satisfies the constitution's "Configuration schema MUST be defined in `config.schema.json`" requirement.
+- **`wetPlate` config** (integer 1-3, default 1) — the default tray: which slot the primary feed switch serves, and what Siri targets. Out-of-range and non-numeric values fall back to 1.
+- **`exposeTraySwitches` config** (boolean, default true). When false, the per-tray switches are removed from the accessory, leaving just the feed and rotate switches.
 - **`enableTrayRotation` config** (boolean, default true). When set false, an already-cached rotate service is removed from the accessory.
+- **`setServiceName()` helper** setting both `Name` and `ConfiguredName`. Apple Home renders `ConfiguredName` on accessories carrying several services of the same type; setting only `Name` left every switch tile showing the same fallback label, with no way to tell them apart.
 - **`setPlatePosition(target, current)`** for absolute positioning, built on the relative step primitive: `(target - current) mod 3` calls with a 600 ms cooldown between them, matching the upstream HA integration's pacing. The tray motor drops steps when calls are issued back to back.
-- 15 test cases across `test/device-type.test.js` and the new `test/wet-feeder.test.js`.
+- 20 test cases across `test/device-type.test.js` and the new `test/wet-feeder.test.js`, including a guard that every exposed switch carries a unique label.
 
 ### Changed
 - **`assertApiOk` is now the shared response validator** for all device commands, replacing the inline check in `triggerFeeding`.
+- **The primary (subtype-less) switch is labelled `Feed Tray N`**, reflecting the configured default, and delegates to the same `serveTray()` path as the per-tray switches.
 - **`getDeviceType` test expectation inverted for PLAF109.** It previously asserted the Polar classified as a plain `FEEDER`; that assertion was pinning the bug.
 
 ### Upgrade note

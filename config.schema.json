@@ -1,0 +1,116 @@
+{
+  "pluginAlias": "PetLibroPlatform",
+  "pluginType": "platform",
+  "singular": true,
+  "headerDisplay": "Bridges PetLibro smart feeders and water fountains to Apple HomeKit.\n\n**Use a dedicated PetLibro account.** PetLibro allows only one active session per account, so sharing credentials with the mobile app will log one of them out. Create a second account and share your devices with it.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Platform Name",
+        "type": "string",
+        "default": "PetLibro Bridge",
+        "required": true
+      },
+      "email": {
+        "title": "PetLibro Email",
+        "type": "string",
+        "format": "email",
+        "required": true,
+        "description": "Email of the dedicated PetLibro account."
+      },
+      "password": {
+        "title": "PetLibro Password",
+        "type": "string",
+        "required": true,
+        "x-schema-form": { "type": "password" },
+        "description": "MD5-hashed before transmission, matching the official app."
+      },
+      "country": {
+        "title": "Country Code",
+        "type": "string",
+        "default": "US",
+        "description": "Two-letter country code sent at login. All regions use the US endpoint."
+      },
+      "timezone": {
+        "title": "Timezone",
+        "type": "string",
+        "default": "America/Chicago",
+        "description": "IANA timezone sent at login, e.g. Europe/Berlin."
+      },
+      "portions": {
+        "title": "Portions per Feed (dry feeders)",
+        "type": "integer",
+        "default": 1,
+        "minimum": 1,
+        "maximum": 10,
+        "description": "Auger revolutions per tap. Dry feeders only — ignored by the Polar wet feeder, which serves a whole tray."
+      },
+      "wetPlate": {
+        "title": "Default Tray (Polar wet feeder)",
+        "type": "integer",
+        "default": 1,
+        "oneOf": [
+          { "title": "Tray 1", "enum": [1] },
+          { "title": "Tray 2", "enum": [2] },
+          { "title": "Tray 3", "enum": [3] }
+        ],
+        "description": "Which tray the main feed switch serves, and the one Siri uses. The per-tray switches can always serve any tray directly."
+      },
+      "exposeTraySwitches": {
+        "title": "Show a switch per tray (Polar wet feeder)",
+        "type": "boolean",
+        "default": true,
+        "description": "Adds Tray 1/2/3 switches so a specific tray can be served directly. Turn off to reduce clutter in the Home app."
+      },
+      "enableTrayRotation": {
+        "title": "Show tray rotation switch (Polar wet feeder)",
+        "type": "boolean",
+        "default": true,
+        "description": "Adds a Rotate Tray switch that advances the tray one position without opening the lid."
+      },
+      "fountainPollingInterval": {
+        "title": "Fountain Polling Interval (seconds)",
+        "type": "integer",
+        "default": 300,
+        "minimum": 30,
+        "description": "How often water level is refreshed for fountains."
+      },
+      "debugDeviceDump": {
+        "title": "Log Raw Device List (diagnostics)",
+        "type": "boolean",
+        "default": false,
+        "description": "Logs the raw /device/device/list response at startup. Useful when reporting an unsupported model. Contains device metadata only — no credentials or tokens."
+      },
+      "apiEndpoint": {
+        "title": "API Endpoint Override",
+        "type": "string",
+        "description": "Advanced. Leave empty to use https://api.us.petlibro.com."
+      }
+    }
+  },
+  "layout": [
+    "name",
+    "email",
+    "password",
+    {
+      "type": "fieldset",
+      "title": "Polar Wet Food Feeder (PLAF109)",
+      "expandable": true,
+      "expanded": true,
+      "items": ["wetPlate", "exposeTraySwitches", "enableTrayRotation"]
+    },
+    {
+      "type": "fieldset",
+      "title": "Dry Feeders & Fountains",
+      "expandable": true,
+      "items": ["portions", "fountainPollingInterval"]
+    },
+    {
+      "type": "fieldset",
+      "title": "Advanced",
+      "expandable": true,
+      "items": ["country", "timezone", "debugDeviceDump", "apiEndpoint"]
+    }
+  ]
+}
