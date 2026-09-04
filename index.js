@@ -667,22 +667,33 @@ class PetLibroWetFeeder extends PetLibroFeeder {
     this._wetStateAt = 0;
 
     const hap = this.platform.api.hap;
-    const rotationEnabled = this.config.enableTrayRotation !== false;
+    // Opt-in: selecting a tray by name is strictly better than stepping the
+    // tray blind, so this is off unless someone explicitly wants a "next slot"
+    // nudge.
+    const rotationEnabled = this.config.enableTrayRotation === true;
     const traySwitches = this.config.exposeTraySwitches !== false;
 
-    // Inherited subtype-less switch: one-tap "rotate to the default tray and
-    // open it", kept so Siri and existing automations have an obvious target.
-    setServiceName(hap, this.switchService, `Feed Tray ${this.plate}`);
-
-    // Stateful lid control. This is the half that was missing: stopFeedNow
-    // works, but nothing exposed it, so a lid could be opened and never shut
-    // from HomeKit.
-    this.lidService = this.accessory.getServiceById(hap.Service.Switch, 'lid')
-      || this.accessory.addService(hap.Service.Switch, 'Lid', 'lid');
+    // The lid IS the accessory's primary (subtype-less) switch.
+    //
+    // A separate one-tap "feed" switch was redundant: it did nothing that
+    // selecting a tray and opening the lid does not already do, and it forced
+    // a second tile that only existed to be a Siri target. Making the lid
+    // primary collapses the two -- "turn on <accessory>" opens the selected
+    // tray, "turn off" closes it -- which is both the natural phrasing and one
+    // fewer control to explain.
+    //
+    // The base constructor wired this characteristic for momentary feeding;
+    // re-registering replaces those handlers with stateful lid ones.
+    this.lidService = this.switchService;
     setServiceName(hap, this.lidService, 'Lid');
-    this.lidService.getCharacteristic(hap.Characteristic.On)
-      .onGet(this.getLidOpen.bind(this))
-      .onSet(this.setLid.bind(this));
+    const lidOn = this.lidService.getCharacteristic(hap.Characteristic.On);
+    lidOn.onGet(this.getLidOpen.bind(this));
+    lidOn.onSet(this.setLid.bind(this));
+
+    // Migration: earlier builds put the lid on its own 'lid' subtype while the
+    // primary switch was a feed button. Drop the duplicate.
+    const legacyLid = this.accessory.getServiceById(hap.Service.Switch, 'lid');
+    if (legacyLid) this.accessory.removeService(legacyLid);
 
     // Tray selector: rotate to a slot WITHOUT opening it.
     this.trayServices = new Map();
@@ -716,7 +727,7 @@ class PetLibroWetFeeder extends PetLibroFeeder {
       if (stale) this.accessory.removeService(stale);
     }
 
-    this.log.info(`  default tray ${this.plate}, per-tray switches ${traySwitches ? 'enabled' : 'disabled'}, rotation ${rotationEnabled ? 'enabled' : 'disabled'}`);
+    this.log.info(`  lid is the primary switch, default tray ${this.plate}, per-tray switches ${traySwitches ? 'enabled' : 'disabled'}, rotation switch ${rotationEnabled ? 'enabled' : 'disabled'}`);
   }
 
   get deviceLabel() {

@@ -2,7 +2,7 @@
   "pluginAlias": "PetLibroPlatform",
   "pluginType": "platform",
   "singular": true,
-  "headerDisplay": "Bridges PetLibro smart feeders and water fountains to Apple HomeKit.\n\n**Use a dedicated PetLibro account.** PetLibro allows only one active session per account, so sharing credentials with the mobile app will log one of them out. Create a second account and share your devices with it.",
+  "headerDisplay": "Bridges PetLibro smart feeders and water fountains to Apple HomeKit.\n\n**Use a dedicated PetLibro account.** PetLibro allows only one active session per account, so sharing credentials with the mobile app will log one of them out. Create a second account and share your devices with it.\n\n**Polar wet feeder:** the accessory's main switch is the **Lid** \u2014 turning it on opens whichever tray is selected, turning it off closes it. `Tray 1/2/3` select the slot.",
   "schema": {
     "type": "object",
     "properties": {
@@ -23,7 +23,9 @@
         "title": "PetLibro Password",
         "type": "string",
         "required": true,
-        "x-schema-form": { "type": "password" },
+        "x-schema-form": {
+          "type": "password"
+        },
         "description": "MD5-hashed before transmission, matching the official app."
       },
       "country": {
@@ -44,30 +46,45 @@
         "default": 1,
         "minimum": 1,
         "maximum": 10,
-        "description": "Auger revolutions per tap. Dry feeders only — ignored by the Polar wet feeder, which serves a whole tray."
+        "description": "Auger revolutions per tap. Dry feeders only \u2014 ignored by the Polar wet feeder, which serves a whole tray."
       },
       "wetPlate": {
-        "title": "Default Tray (Polar wet feeder)",
+        "title": "Fallback Tray (Polar wet feeder)",
         "type": "integer",
         "default": 1,
         "oneOf": [
-          { "title": "Tray 1", "enum": [1] },
-          { "title": "Tray 2", "enum": [2] },
-          { "title": "Tray 3", "enum": [3] }
+          {
+            "title": "Tray 1",
+            "enum": [
+              1
+            ]
+          },
+          {
+            "title": "Tray 2",
+            "enum": [
+              2
+            ]
+          },
+          {
+            "title": "Tray 3",
+            "enum": [
+              3
+            ]
+          }
         ],
-        "description": "Which tray the main feed switch serves, and the one Siri uses. The per-tray switches can always serve any tray directly."
+        "description": "Only used when the feeder does not report its current tray position. Normally the lid opens whichever tray is currently selected, and that selection persists, so this rarely applies."
       },
       "exposeTraySwitches": {
         "title": "Show a switch per tray (Polar wet feeder)",
         "type": "boolean",
         "default": true,
-        "description": "Adds Tray 1/2/3 switches so a specific tray can be served directly. Turn off to reduce clutter in the Home app."
+        "description": "Adds Tray 1/2/3 switches showing which slot is in position; tap one to rotate to it. Turn off to leave only the Lid control."
       },
       "enableTrayRotation": {
-        "title": "Show tray rotation switch (Polar wet feeder)",
+        "title": "Show \"Rotate Tray\" nudge switch (Polar wet feeder)",
         "type": "boolean",
-        "default": true,
-        "description": "Adds a Rotate Tray switch that advances the tray one position without opening the lid."
+        "default": false,
+        "description": "Off by default. Adds a switch that advances the tray one slot without saying which. The per-tray switches do this better by naming the slot you want; this exists only if you prefer a blind \"next\" nudge."
       },
       "fountainPollingInterval": {
         "title": "Fountain Polling Interval (seconds)",
@@ -80,7 +97,7 @@
         "title": "Log Raw Device List (diagnostics)",
         "type": "boolean",
         "default": false,
-        "description": "Logs the raw /device/device/list response at startup. Useful when reporting an unsupported model. Contains device metadata only — no credentials or tokens."
+        "description": "Logs the raw /device/device/list response at startup. Useful when reporting an unsupported model. Contains device metadata only \u2014 no credentials or tokens."
       },
       "apiEndpoint": {
         "title": "API Endpoint Override",
@@ -98,19 +115,31 @@
       "title": "Polar Wet Food Feeder (PLAF109)",
       "expandable": true,
       "expanded": true,
-      "items": ["wetPlate", "exposeTraySwitches", "enableTrayRotation"]
+      "items": [
+        "exposeTraySwitches",
+        "enableTrayRotation"
+      ]
     },
     {
       "type": "fieldset",
       "title": "Dry Feeders & Fountains",
       "expandable": true,
-      "items": ["portions", "fountainPollingInterval"]
+      "items": [
+        "portions",
+        "fountainPollingInterval"
+      ]
     },
     {
       "type": "fieldset",
       "title": "Advanced",
       "expandable": true,
-      "items": ["country", "timezone", "debugDeviceDump", "apiEndpoint"]
+      "items": [
+        "wetPlate",
+        "country",
+        "timezone",
+        "debugDeviceDump",
+        "apiEndpoint"
+      ]
     }
   ]
 }

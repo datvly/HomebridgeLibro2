@@ -12,14 +12,14 @@ Adds support for the PLAF109 "Polar" wet food feeder (Wave C of the device-expan
 
 ### Added
 - **`DEVICE_TYPE.WET_FEEDER` and the `PetLibroWetFeeder` class.** Detection keys on `productIdentifier === 'PLAF109'` with a `productName` containing "Polar" as fallback. Deliberately not serial-prefix based: Polar and Granary serials share the same `AF` family code, so a prefix check cannot separate them.
-- **A `Lid` switch** (stateful) that opens and closes the currently selected tray. `stopFeedNow` worked all along but nothing exposed it, so a lid could be opened from HomeKit and never shut again.
+- **The lid is the accessory's primary switch** (stateful), so "turn on <accessory>" opens the selected tray and "turn off" closes it. `stopFeedNow` worked all along but nothing exposed it, so a lid could be opened from HomeKit and never shut again. Making the lid primary also removes the need for a separate one-tap feed tile, which did nothing that selecting a tray and opening the lid does not already do and existed only to be a Siri target.
 - **A stateful switch per tray** (`Tray 1` / `Tray 2` / `Tray 3`, subtypes `serve-N`) showing which slot is currently in position and rotating to it when tapped, *without* opening the lid. Together with `Lid` this gives the two-step "pick a tray, then decide to open it" flow; previously the only way to reach a slot was to step the tray blind and guess where it landed, since the API exposes no absolute "go to tray N" call. Switching a tray off is ignored and snapped back, since a position is not a toggle.
 - **Live state via `wetListV3`** (`{id}`, not `{deviceSn}` — it answers `code 1002 "id must not be null"` otherwise), which reports `platePosition` and `manualFeedId`. `manualFeedId` is null exactly when the lid is shut, so both tray position and lid state are genuinely observable and are modelled as stateful switches rather than write-only buttons. Reads are cached for 8s because Apple Home fires `onGet` for every switch at once when a tile opens.
 - **Standalone tray rotation as a Switch** (subtype `rotate`, labelled `Rotate Tray`). Momentary. Advances one slot without opening the lid — not reachable from the official app, which only rotates as a side effect of feeding.
 - **`config.schema.json`**, which the repo previously lacked entirely. Every existing option (`email`, `password`, `country`, `timezone`, `portions`, `fountainPollingInterval`, `debugDeviceDump`, `apiEndpoint`) plus the three new ones are now editable in Config UI X instead of by hand-editing `config.json`. The default tray is a dropdown. Satisfies the constitution's "Configuration schema MUST be defined in `config.schema.json`" requirement.
-- **`wetPlate` config** (integer 1-3, default 1) — the default tray: which slot the primary feed switch serves, and what Siri targets. Out-of-range and non-numeric values fall back to 1.
+- **`wetPlate` config** (integer 1-3, default 1) — a *fallback* only, used when the feeder does not report its current tray position. The lid otherwise opens whichever tray is selected, and that selection persists on the device. Out-of-range and non-numeric values fall back to 1.
 - **`exposeTraySwitches` config** (boolean, default true). When false, the per-tray switches are removed from the accessory, leaving just the feed and rotate switches.
-- **`enableTrayRotation` config** (boolean, default true). When set false, an already-cached rotate service is removed from the accessory.
+- **`enableTrayRotation` config** (boolean, **default false**). The rotate switch advances one slot without naming it, which per-tray selection supersedes; it is opt-in for anyone who prefers a blind "next" nudge. When false, an already-cached rotate service is removed from the accessory.
 - **`setServiceName()` helper** setting both `Name` and `ConfiguredName`. Apple Home renders `ConfiguredName` on accessories carrying several services of the same type; setting only `Name` left every switch tile showing the same fallback label, with no way to tell them apart.
 - **`setPlatePosition(target, current)`** for absolute positioning, built on the relative step primitive: `(target - current) mod 3` calls with a 600 ms cooldown between them, matching the upstream HA integration's pacing. The tray motor drops steps when calls are issued back to back.
 - 20 test cases across `test/device-type.test.js` and the new `test/wet-feeder.test.js`, including a guard that every exposed switch carries a unique label.
@@ -28,6 +28,17 @@ Adds support for the PLAF109 "Polar" wet food feeder (Wave C of the device-expan
 - **`assertApiOk` is now the shared response validator** for all device commands, replacing the inline check in `triggerFeeding`.
 - **The primary (subtype-less) switch is labelled `Feed Tray N`**, reflecting the configured default, and delegates to the same `serveTray()` path as the per-tray switches.
 - **`getDeviceType` test expectation inverted for PLAF109.** It previously asserted the Polar classified as a plain `FEEDER`; that assertion was pinning the bug.
+
+### HomeKit layout
+
+Four tiles, no redundancy:
+
+| Tile | Type | Behavior |
+|---|---|---|
+| `Tray 1` / `Tray 2` / `Tray 3` | stateful | Shows which slot is in position; tap to rotate to it. Never dispenses. |
+| `Lid` (primary switch) | stateful | Opens the selected tray / closes it. |
+
+An earlier iteration of this branch also shipped a `Feed Tray N` button and an always-on `Rotate Tray` switch. Both were redundant against the tray selectors and have been folded away — the lid absorbed the feed button, and rotation became opt-in.
 
 ### Upgrade note
 The accessory UUID seed includes the device type, so a PLAF109 previously cached as `feeder` gets a new UUID as `wet_feeder`. **The old Polar accessory is unregistered and a new one appears**, which means a one-time room reassignment, rename, and re-add to any scenes or automations in Apple Home. Other devices are unaffected.

@@ -226,8 +226,15 @@ test('setPlatePosition converts absolute target into modular steps', async (t) =
   assert.equal(n, 0);
 });
 
-test('rotate switch is exposed by default and refuses when offline', async (t) => {
+test('rotate switch is NOT exposed by default (superseded by tray selection)', () => {
   const { platform, hap } = makePlatform();
+  const accessory = makeStubAccessory(hap);
+  new PetLibroWetFeeder(platform, accessory, POLAR);
+  assert.equal(accessory.getServiceById(hap.Service.Switch, 'rotate'), undefined);
+});
+
+test('rotate switch can be opted into, and refuses when offline', async (t) => {
+  const { platform, hap } = makePlatform({ enableTrayRotation: true });
   const accessory = makeStubAccessory(hap);
   const feeder = new PetLibroWetFeeder(platform, accessory, Object.assign({}, POLAR, { online: false }));
 
@@ -251,21 +258,44 @@ test('enableTrayRotation:false omits the rotate switch', () => {
   assert.ok(accessory.getService(hap.Service.Switch), 'feed switch should still exist');
 });
 
-test('feed switch and rotate switch are distinct services', () => {
+test('the lid IS the primary switch, not a separate tile', () => {
+  const { platform, hap } = makePlatform();
+  const accessory = makeStubAccessory(hap);
+  const feeder = new PetLibroWetFeeder(platform, accessory, POLAR);
+
+  const primary = accessory.getService(hap.Service.Switch);
+  assert.equal(feeder.lidService, primary, 'lid should be the subtype-less service');
+  assert.equal(primary._names.configured, 'Lid');
+
+  // No leftover duplicate lid tile from the earlier layout.
+  assert.equal(accessory.getServiceById(hap.Service.Switch, 'lid'), undefined);
+});
+
+test('a cached legacy lid service is migrated away', () => {
+  const { platform, hap } = makePlatform();
+  const accessory = makeStubAccessory(hap);
+  // Simulate an accessory cached by the earlier build.
+  accessory.addService(hap.Service.Switch, 'Lid', 'lid');
+
+  new PetLibroWetFeeder(platform, accessory, POLAR);
+  assert.equal(accessory.getServiceById(hap.Service.Switch, 'lid'), undefined);
+});
+
+test('default layout is exactly four tiles: three trays plus the lid', () => {
   const { platform, hap } = makePlatform();
   const accessory = makeStubAccessory(hap);
   new PetLibroWetFeeder(platform, accessory, POLAR);
 
-  const feed = accessory.getService(hap.Service.Switch);
-  const rotate = accessory.getServiceById(hap.Service.Switch, 'rotate');
-  assert.ok(feed && rotate);
-  assert.notEqual(feed, rotate);
+  const switches = accessory._services.filter(s => s._type === hap.Service.Switch);
+  assert.equal(switches.length, 4, 'expected 4 switches, got ' + switches.map(s => s._names.configured).join(', '));
+  const labels = switches.map(s => s._names.configured).sort();
+  assert.deepEqual(labels, ['Lid', 'Tray 1', 'Tray 2', 'Tray 3']);
 });
 
 
 // --- per-tray switches & naming ----------------------------------------
 
-test('exposes one momentary switch per tray, each distinctly named', () => {
+test('exposes one switch per tray, each distinctly named', () => {
   const { platform, hap } = makePlatform();
   const accessory = makeStubAccessory(hap);
   new PetLibroWetFeeder(platform, accessory, POLAR);
@@ -280,14 +310,8 @@ test('exposes one momentary switch per tray, each distinctly named', () => {
 
   // ConfiguredName is what Apple Home renders; without it every tile on a
   // multi-service accessory shows the same fallback label.
-  const rotate = accessory.getServiceById(hap.Service.Switch, 'rotate');
-  assert.equal(rotate._names.configured, 'Rotate Tray');
-
-  const feed = accessory.getService(hap.Service.Switch);
-  assert.equal(feed._names.configured, 'Feed Tray 1');
-
-  // Every visible switch must have a unique label.
-  const all = [feed, rotate, ...[1,2,3].map(p => accessory.getServiceById(hap.Service.Switch, `serve-${p}`))]
+  const all = accessory._services
+    .filter(s => s._type === hap.Service.Switch)
     .map(s => s._names.configured);
   assert.equal(new Set(all).size, all.length, 'labels must be unique: ' + all.join(', '));
 });
@@ -307,21 +331,36 @@ test('serveTray opens the tray it is given, regardless of the default', async (t
   assert.equal(calls[0].plate, 3);
 });
 
-test('default tray drives the primary feed switch and its label', async (t) => {
+test('wetPlate is only a fallback when the live position is unreadable', async (t) => {
   const { platform, hap } = makePlatform({ wetPlate: 3 });
-  const accessory = makeStubAccessory(hap);
-  const feeder = new PetLibroWetFeeder(platform, accessory, POLAR);
-
-  assert.equal(accessory.getService(hap.Service.Switch)._names.configured, 'Feed Tray 3');
+  const feeder = new PetLibroWetFeeder(platform, makeStubAccessory(hap), POLAR);
 
   const calls = [];
+  // platePosition null => position unknown, so the fallback applies.
   t.mock.method(axios, 'post', async (url, body) => {
-    calls.push(body);
+    calls.push({ url, body });
+    if (/wetListV3$/.test(url)) {
+      return { status: 200, data: { code: 0, data: { platePosition: null, manualFeedId: null } } };
+    }
     return { status: 200, data: { code: 0 } };
   });
 
-  await feeder.triggerFeeding();
-  assert.equal(calls[0].plate, 3, 'feed switch should serve the configured default');
+  await feeder.setLid(true);
+  const feed = calls.find(c => /manualFeedNow$/.test(c.url));
+  assert.equal(feed.body.plate, 3, 'should fall back to wetPlate');
+});
+
+test('a readable position always wins over wetPlate', async (t) => {
+  const { platform, hap } = makePlatform({ wetPlate: 3 });
+  const feeder = new PetLibroWetFeeder(platform, makeStubAccessory(hap), POLAR);
+
+  const state = { platePosition: 2, manualFeedId: null };
+  const calls = [];
+  mockWetApi(t, state, calls);
+
+  await feeder.setLid(true);
+  const feed = calls.find(c => /manualFeedNow$/.test(c.url));
+  assert.equal(feed.body.plate, 2);
 });
 
 test('exposeTraySwitches:false hides the per-tray switches', () => {
@@ -332,8 +371,7 @@ test('exposeTraySwitches:false hides the per-tray switches', () => {
   for (let p = 1; p <= WET_FEEDER_PLATE_COUNT; p++) {
     assert.equal(accessory.getServiceById(hap.Service.Switch, `serve-${p}`), undefined);
   }
-  assert.ok(accessory.getService(hap.Service.Switch), 'primary feed switch survives');
-  assert.ok(accessory.getServiceById(hap.Service.Switch, 'rotate'), 'rotate survives');
+  assert.ok(accessory.getService(hap.Service.Switch), 'the lid (primary switch) survives');
 });
 
 test('selecting a tray while offline refuses and does not call the API', async (t) => {
