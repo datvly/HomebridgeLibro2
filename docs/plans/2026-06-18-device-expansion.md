@@ -17,7 +17,7 @@ The Home Assistant integration supports **11 device families** across feeders, f
 | PLAF103 | Granary v2 | `feeders/granary_smart_feeder.py` | ✅ shipping | Switch (1s momentary) |
 | PLAF107 | Space | `feeders/space_smart_feeder.py` | 🟡 untested | Switch (reuse) |
 | PLAF108 | Air | `feeders/air_smart_feeder.py` | 🟡 untested | Switch (reuse) |
-| PLAF109 | Polar Wet | `feeders/polar_wet_food_feeder.py` | ❌ wrong endpoint | Switch (leaky — plate rotation) |
+| PLAF109 | Polar Wet | `feeders/polar_wet_food_feeder.py` | ✅ shipping (v1.6.0) | Switch (feed) + Switch (rotate, subtype `rotate`) |
 | PLAF203 | Granary Camera | `feeders/granary_smart_camera_feeder.py` | 🟡 untested | Switch (camera unsupported) |
 | PLAF301 | One RFID | `feeders/one_rfid_smart_feeder.py` | 🟡 untested | Switch (reuse) |
 | PLWF105 | Dockstream | `fountains/dockstream_smart_fountain.py` | ✅ shipping | HumiditySensor |
@@ -73,7 +73,26 @@ After Wave A returns data:
 - Fall back to current heuristic for unknown SKUs.
 - Tests in `test/device-type.test.js`: one assertion per known SKU; one assertion for unknown SKU falling back to feeder.
 
-### Wave C — PLAF109 Polar Wet (medium effort)
+### Wave C — PLAF109 Polar Wet (medium effort) — ✅ SHIPPED in v1.6.0
+
+Implemented as planned, with three deviations recorded after verifying against
+live hardware (PLAF109, firmware 2.0.28, 2026-09-04):
+
+1. **`platePositionChange` is a relative step, not a destination.** The `plate`
+   value in the body is ignored as a target — every call advances exactly one
+   slot. Absolute positioning is therefore a client-side loop,
+   `(target - current) mod 3`, with a 600ms cooldown between calls (the motor
+   drops steps when they are issued back to back). Implemented as
+   `setPlatePosition(target, current)`.
+2. **Rotation is exposed as its own Switch** (subtype `rotate`), not folded into
+   the feed switch. Rotating does **not** open the lid, so it is a genuinely
+   separate action rather than a variant of feeding; `manualFeedNow` opens and
+   `stopFeedNow` closes.
+3. **Detection uses `productIdentifier`, not the serial prefix.** Polar and
+   Granary both carry the `AF` family code, so the §5b serial-prefix approach
+   cannot discriminate them.
+
+Original plan retained below for reference.
 
 - Subclass `PetLibroFeeder` → `PetLibroWetFeeder`. Override `triggerFeeding` to POST `/device/wetFeedingPlan/manualFeedNow` with `{deviceSn, plate: config.wetPlate || 1}`.
 - New config field: `wetPlate` (integer 1-N, default 1).
@@ -108,7 +127,17 @@ Skip until upstream lands code. Track issue #214.
 
 1. Real `productIdentifier` strings per model — **partially confirmed** (see §5b). PLAF107/108/109/301 and PLWF305/106/116 still unconfirmed.
 2. PLWF116 cordless battery field — unknown. May warrant `Service.Battery` alongside HumiditySensor.
-3. PLAF109 Switch semantics — does upstream tap `manualFeedNow` (dispense current plate) or `platePositionChange` (rotate)? Read `polar_wet_food_feeder.py` before Wave C.
+3. PLAF109 Switch semantics — **ANSWERED (2026-09-04, live hardware).** Both, and
+   they are distinct actions, so v1.6.0 exposes both as separate switches.
+   `manualFeedNow {deviceSn, plate}` rotates the requested slot into place *and*
+   opens the lid; `platePositionChange {deviceSn, plate:1}` advances one slot with
+   the lid staying shut; `stopFeedNow {deviceSn, feedId}` closes it and clears
+   `manualFeedId`. All three return `code: 0`. Separately confirmed: re-serving an
+   already-served slot (`state: 6`) also returns `code: 0`, so the mobile app's
+   "cannot reopen a used slot" restriction is client-side and is not enforced by
+   the plugin. The plan object additionally exposes `enableFeedAgainWithThaw`,
+   `feedAgainDuration` and `feedAgainExecutionEndTime`, which appear to govern
+   *scheduled* re-serving and remain unmapped.
 4. Cached-accessory migration on detection-table changes — accept one-bridge-restart cost or force re-detection on version bump?
 
 ## 5b. Confirmed real-world serial prefixes (captured from v1.5.1 production logs, 2026-06-20)
@@ -138,6 +167,6 @@ The PetLibro API returns serial numbers using a **2-char family code** prefix �
 
 - v1.4.1: debug-dump opt-in for `/device/device/list`. PATCH (no behavior change for existing users).
 - v1.5.0: explicit `KNOWN_DEVICES` detection table (Wave B). MINOR.
-- v1.6.0: PLAF109 Polar Wet (Wave C). MINOR.
+- v1.6.0: PLAF109 Polar Wet (Wave C). MINOR. ✅ released 2026-09-04.
 - v1.7.0: hopper-empty OccupancySensor (Wave D). MINOR.
 - v2.0.0: PLLB001 Luma litter box (Wave E). MAJOR — adds new device-type enum and may force cache invalidation for users with edge-case prior classifications.
