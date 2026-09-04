@@ -110,6 +110,11 @@ const WET_FEEDER_PLATE_COUNT = 3;
 // back drops steps.
 const PLATE_ROTATION_COOLDOWN_MS = 600;
 
+// How long a wetListV3 read stays fresh. Apple Home fires onGet for every
+// switch on an accessory at once when its tile opens; without a short cache
+// that is one cloud round-trip per switch.
+const WET_STATE_TTL_MS = 8000;
+
 function resolveWetPlate(config) {
   const raw = parseInt((config && config.wetPlate) || 1, 10);
   if (!Number.isFinite(raw) || raw < 1 || raw > WET_FEEDER_PLATE_COUNT) return 1;
@@ -629,24 +634,58 @@ class PetLibroFeeder {
 // `plate` value sent; it is a relative step, not a destination. Re-serving an
 // already-served slot returns code 0, so the mobile app's "cannot reopen a
 // used slot" restriction is client-side only and is not enforced here.
+// PLAF109 "Polar" wet food feeder.
+//
+// Mechanically unlike the dry feeders: food sits in a 3-slot rotating tray
+// under a lid, so "feed" means "bring a slot to the opening and open the lid",
+// not "auger N portions". The dry-feed endpoint is rejected outright --
+// /device/device/manualFeeding answers HTTP 200 with API code 2020
+// ("Device response timeout") because the firmware never replies to a grainNum
+// command. Verified against a live PLAF109 (firmware 2.0.28) on 2026-09-04:
+//
+//   manualFeedNow       {deviceSn, plate}   -> code 0, rotates AND opens
+//   platePositionChange {deviceSn, plate:1} -> code 0, advances ONE slot only
+//   stopFeedNow         {deviceSn, feedId}  -> code 0, closes the lid
+//   wetListV3           {id}                -> platePosition + manualFeedId
+//
+// Two things drive the HomeKit layout here. platePositionChange is a relative
+// step whose `plate` value is ignored as a target, and it never opens the lid;
+// and wetListV3 reports both the current slot and whether a feed is open
+// (manualFeedId is null exactly when the lid is shut). That makes tray position
+// and lid state genuinely observable, so both are modelled as stateful
+// switches rather than write-only buttons: Tray 1/2/3 show which slot is
+// current and rotate to it when tapped, and Lid reflects and controls whether
+// that slot is open. Re-opening an already-served slot returns code 0, so the
+// mobile app's "cannot reopen a used slot" rule is client-side and not
+// reproduced here.
 class PetLibroWetFeeder extends PetLibroFeeder {
   constructor(platform, accessory, device) {
     super(platform, accessory, device);
 
     this.plate = resolveWetPlate(this.config);
+    this._wetState = null;
+    this._wetStateAt = 0;
 
     const hap = this.platform.api.hap;
     const rotationEnabled = this.config.enableTrayRotation !== false;
     const traySwitches = this.config.exposeTraySwitches !== false;
 
-    // Inherited primary switch = "feed the default tray". Kept as the service
-    // without a subtype so Siri and existing automations still have one obvious
-    // target on this accessory.
+    // Inherited subtype-less switch: one-tap "rotate to the default tray and
+    // open it", kept so Siri and existing automations have an obvious target.
     setServiceName(hap, this.switchService, `Feed Tray ${this.plate}`);
 
-    // One momentary switch per tray, so a specific slot can be served directly
-    // instead of stepping the tray blind and guessing where it landed.
-    this.serveServices = [];
+    // Stateful lid control. This is the half that was missing: stopFeedNow
+    // works, but nothing exposed it, so a lid could be opened and never shut
+    // from HomeKit.
+    this.lidService = this.accessory.getServiceById(hap.Service.Switch, 'lid')
+      || this.accessory.addService(hap.Service.Switch, 'Lid', 'lid');
+    setServiceName(hap, this.lidService, 'Lid');
+    this.lidService.getCharacteristic(hap.Characteristic.On)
+      .onGet(this.getLidOpen.bind(this))
+      .onSet(this.setLid.bind(this));
+
+    // Tray selector: rotate to a slot WITHOUT opening it.
+    this.trayServices = new Map();
     for (let plate = 1; plate <= WET_FEEDER_PLATE_COUNT; plate++) {
       const subtype = `serve-${plate}`;
       const existing = this.accessory.getServiceById(hap.Service.Switch, subtype);
@@ -660,22 +699,19 @@ class PetLibroWetFeeder extends PetLibroFeeder {
         || this.accessory.addService(hap.Service.Switch, `Tray ${plate}`, subtype);
       setServiceName(hap, svc, `Tray ${plate}`);
       svc.getCharacteristic(hap.Characteristic.On)
-        .onGet(async () => false)
-        .onSet((value) => this.setServeTray(plate, value));
-      this.serveServices.push(svc);
+        .onGet(() => this.getTrayActive(plate))
+        .onSet((value) => this.setTrayActive(plate, value));
+      this.trayServices.set(plate, svc);
     }
 
     if (rotationEnabled) {
-      const subtype = 'rotate';
-      this.rotateService = this.accessory.getServiceById(hap.Service.Switch, subtype)
-        || this.accessory.addService(hap.Service.Switch, 'Rotate Tray', subtype);
+      this.rotateService = this.accessory.getServiceById(hap.Service.Switch, 'rotate')
+        || this.accessory.addService(hap.Service.Switch, 'Rotate Tray', 'rotate');
       setServiceName(hap, this.rotateService, 'Rotate Tray');
       this.rotateService.getCharacteristic(hap.Characteristic.On)
         .onGet(async () => false)
         .onSet(this.setRotate.bind(this));
     } else {
-      // Config flipped off after the service was already cached — drop it so
-      // HomeKit stops showing a control that no longer does anything.
       const stale = this.accessory.getServiceById(hap.Service.Switch, 'rotate');
       if (stale) this.accessory.removeService(stale);
     }
@@ -683,37 +719,174 @@ class PetLibroWetFeeder extends PetLibroFeeder {
     this.log.info(`  default tray ${this.plate}, per-tray switches ${traySwitches ? 'enabled' : 'disabled'}, rotation ${rotationEnabled ? 'enabled' : 'disabled'}`);
   }
 
-  // Serve one specific tray. Momentary, mirroring the feed switch.
-  async setServeTray(plate, value) {
-    if (!value) return;
+  get deviceLabel() {
+    return 'wet feeder';
+  }
 
-    const hap = this.platform.api.hap;
-    const svc = this.accessory.getServiceById(hap.Service.Switch, `serve-${plate}`);
-    const reset = (ms) => setTimeout(() => {
-      if (svc) svc.getCharacteristic(hap.Characteristic.On).updateValue(false);
-    }, ms);
+  // --- state ------------------------------------------------------------
 
+  // Current tray position and lid state. Briefly cached: Apple Home fires
+  // onGet for every switch at once when the tile opens, and without this each
+  // one would issue its own cloud round-trip.
+  async fetchWetState(force = false) {
+    const now = Date.now();
+    if (!force && this._wetState && (now - this._wetStateAt) < WET_STATE_TTL_MS) {
+      return this._wetState;
+    }
+    const response = await this.platform.apiPost('/device/wetFeedingPlan/wetListV3', {
+      id: this.deviceId
+    }, { timeout: 15000 });
+    assertApiOk(response, 'Wet feeder state');
+
+    const data = (response.data && response.data.data) || {};
+    this._wetState = {
+      platePosition: typeof data.platePosition === 'number' ? data.platePosition : null,
+      // Null exactly when the lid is shut.
+      manualFeedId: (data.manualFeedId === undefined) ? null : data.manualFeedId
+    };
+    this._wetStateAt = now;
+    return this._wetState;
+  }
+
+  invalidateWetState() {
+    this._wetState = null;
+    this._wetStateAt = 0;
+  }
+
+  requireOnline(action) {
     if (this.device && this.device.online === false) {
-      this.log.warn(`[${this.name}] Device reports offline; refusing to serve tray ${plate}`);
-      reset(100);
+      this.log.warn(`[${this.name}] Device reports offline; refusing to ${action}`);
+      const hap = this.platform.api.hap;
       if (hap.HapStatusError && hap.HAPStatus) {
         throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
       }
       throw new Error('Device offline');
     }
+  }
 
+  // Push fresh values into every stateful characteristic after a change.
+  async refreshCharacteristics() {
+    const hap = this.platform.api.hap;
     try {
-      await this.serveTray(plate);
-      this.log(`[${this.name}] Served tray ${plate}`);
-      reset(1000);
+      const state = await this.fetchWetState(true);
+      if (this.lidService) {
+        this.lidService.getCharacteristic(hap.Characteristic.On)
+          .updateValue(state.manualFeedId != null);
+      }
+      for (const [plate, svc] of this.trayServices) {
+        svc.getCharacteristic(hap.Characteristic.On)
+          .updateValue(state.platePosition === plate);
+      }
     } catch (error) {
-      this.log.error(`[${this.name}] Failed to serve tray ${plate}:`, error.message);
-      reset(100);
+      this.log.debug(`[${this.name}] Could not refresh state: ${error.message}`);
     }
   }
 
-  // Open the lid on a given tray. Re-serving an already-served tray is allowed
-  // by the server (verified: code 0), so no guard here.
+  // --- lid --------------------------------------------------------------
+
+  async getLidOpen() {
+    const state = await this.fetchWetState();
+    return state.manualFeedId != null;
+  }
+
+  async setLid(value) {
+    this.requireOnline(value ? 'open the lid' : 'close the lid');
+    try {
+      const state = await this.fetchWetState(true);
+      if (value) {
+        // Open whichever tray is currently in position, so "pick a tray, then
+        // open it" behaves the way the tray switches imply.
+        const plate = state.platePosition || this.plate;
+        await this.serveTray(plate);
+        this.log(`[${this.name}] Lid opened on tray ${plate}`);
+      } else {
+        if (state.manualFeedId == null) {
+          this.log(`[${this.name}] Lid already closed`);
+          return;
+        }
+        await this.stopFeed(state.manualFeedId);
+        this.log(`[${this.name}] Lid closed`);
+      }
+      this.invalidateWetState();
+      await this.refreshCharacteristics();
+    } catch (error) {
+      this.log.error(`[${this.name}] Failed to ${value ? 'open' : 'close'} lid:`, error.message);
+      this.invalidateWetState();
+      await this.refreshCharacteristics();
+      const hap = this.platform.api.hap;
+      if (hap.HapStatusError && hap.HAPStatus) {
+        throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+      }
+      throw error;
+    }
+  }
+
+  async stopFeed(feedId) {
+    const response = await this.platform.apiPost('/device/wetFeedingPlan/stopFeedNow', {
+      deviceSn: this.deviceId,
+      feedId,
+      requestId: this.generateRequestId()
+    }, { timeout: 15000 });
+    assertApiOk(response, 'Close lid');
+  }
+
+  // --- tray selection ---------------------------------------------------
+
+  async getTrayActive(plate) {
+    const state = await this.fetchWetState();
+    return state.platePosition === plate;
+  }
+
+  async setTrayActive(plate, value) {
+    const hap = this.platform.api.hap;
+
+    // A tray is a position, not a toggle: switching one "off" has no meaning.
+    // Snap the characteristic back to the truth instead of silently accepting.
+    if (!value) {
+      setTimeout(() => this.refreshCharacteristics(), 100);
+      return;
+    }
+
+    this.requireOnline(`rotate to tray ${plate}`);
+
+    try {
+      const state = await this.fetchWetState(true);
+      const current = state.platePosition;
+      if (current == null) {
+        throw new Error('current tray position unknown');
+      }
+      const steps = await this.setPlatePosition(plate, current);
+      this.log(`[${this.name}] Tray ${plate} selected (${steps} step(s) from ${current})`);
+      this.invalidateWetState();
+      await this.refreshCharacteristics();
+    } catch (error) {
+      this.log.error(`[${this.name}] Failed to select tray ${plate}:`, error.message);
+      this.invalidateWetState();
+      await this.refreshCharacteristics();
+      if (hap.HapStatusError && hap.HAPStatus) {
+        throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+      }
+      throw error;
+    }
+  }
+
+  // --- feeding ----------------------------------------------------------
+
+  async triggerFeeding() {
+    if (!this.deviceId) {
+      throw new Error('Device ID not found - cannot send feed command');
+    }
+    // `portions` is a dry-feeder concept (auger revolutions) and has no
+    // meaning here; the tray slot is the unit of service.
+    this.log(`[${this.name}] Sending wet feed command (default tray ${this.plate})`);
+    await this.serveTray(this.plate);
+    this.log(`[${this.name}] Wet feeding triggered successfully (tray ${this.plate})`);
+    this.invalidateWetState();
+    await this.refreshCharacteristics();
+  }
+
+  // Rotate the given tray into place and open the lid on it. Re-serving an
+  // already-served tray is permitted by the server (verified: code 0).
   async serveTray(plate) {
     if (!this.deviceId) {
       throw new Error('Device ID not found - cannot send feed command');
@@ -726,23 +899,9 @@ class PetLibroWetFeeder extends PetLibroFeeder {
     assertApiOk(response, `Serve tray ${plate}`);
   }
 
-  get deviceLabel() {
-    return 'wet feeder';
-  }
+  // --- rotation ---------------------------------------------------------
 
-  async triggerFeeding() {
-    if (!this.deviceId) {
-      throw new Error('Device ID not found - cannot send feed command');
-    }
-
-    // `portions` is a dry-feeder concept (auger revolutions) and has no
-    // meaning here; the tray slot is the unit of service.
-    this.log(`[${this.name}] Sending wet feed command (default tray ${this.plate})`);
-    await this.serveTray(this.plate);
-    this.log(`[${this.name}] Wet feeding triggered successfully (tray ${this.plate})`);
-  }
-
-  // Advance the tray one slot. Momentary, like the feed switch.
+  // Advance the tray one slot. Momentary: rotation is a nudge, not a state.
   async setRotate(value) {
     if (!value) return;
 
@@ -764,6 +923,8 @@ class PetLibroWetFeeder extends PetLibroFeeder {
       await this.rotateTray(1);
       this.log(`[${this.name}] Tray rotation completed`);
       reset(1000);
+      this.invalidateWetState();
+      await this.refreshCharacteristics();
     } catch (error) {
       this.log.error(`[${this.name}] Failed to rotate tray:`, error.message);
       reset(100);
@@ -802,6 +963,7 @@ class PetLibroWetFeeder extends PetLibroFeeder {
     return steps;
   }
 }
+
 
 class PetLibroFountain {
   constructor(platform, accessory, device) {

@@ -154,17 +154,19 @@ test('wet feeder feeds via manualFeedNow with a plate, never the dry endpoint', 
   const calls = [];
   t.mock.method(axios, 'post', async (url, body) => {
     calls.push({ url, body });
-    return { status: 200, data: { code: 0 } };
+    return { status: 200, data: { code: 0, data: { platePosition: 2, manualFeedId: 1 } } };
   });
 
   await feeder.triggerFeeding();
 
-  assert.equal(calls.length, 1);
-  assert.match(calls[0].url, /\/device\/wetFeedingPlan\/manualFeedNow$/);
-  assert.equal(calls[0].body.plate, 2);
-  assert.equal(calls[0].body.deviceSn, POLAR.deviceSn);
-  assert.equal(typeof calls[0].body.requestId, 'string');
-  assert.equal(calls[0].body.grainNum, undefined);
+  const feeds = calls.filter(c => /manualFeedNow$/.test(c.url));
+  assert.equal(feeds.length, 1);
+  assert.equal(feeds[0].body.plate, 2);
+  assert.equal(feeds[0].body.deviceSn, POLAR.deviceSn);
+  assert.equal(typeof feeds[0].body.requestId, 'string');
+  assert.equal(feeds[0].body.grainNum, undefined);
+  // The dry-feeder endpoint must never be touched for a wet feeder.
+  assert.equal(calls.filter(c => /device\/manualFeeding$/.test(c.url)).length, 0);
 });
 
 test('wet feeder surfaces code 2020 instead of a bare HTTP status', async (t) => {
@@ -290,7 +292,7 @@ test('exposes one momentary switch per tray, each distinctly named', () => {
   assert.equal(new Set(all).size, all.length, 'labels must be unique: ' + all.join(', '));
 });
 
-test('tray switch serves that exact tray, regardless of the default', async (t) => {
+test('serveTray opens the tray it is given, regardless of the default', async (t) => {
   const { platform, hap } = makePlatform({ wetPlate: 1 });
   const accessory = makeStubAccessory(hap);
   const feeder = new PetLibroWetFeeder(platform, accessory, POLAR);
@@ -334,7 +336,7 @@ test('exposeTraySwitches:false hides the per-tray switches', () => {
   assert.ok(accessory.getServiceById(hap.Service.Switch, 'rotate'), 'rotate survives');
 });
 
-test('serving a tray while offline refuses and does not call the API', async (t) => {
+test('selecting a tray while offline refuses and does not call the API', async (t) => {
   const { platform, hap } = makePlatform();
   const accessory = makeStubAccessory(hap);
   const feeder = new PetLibroWetFeeder(platform, accessory, Object.assign({}, POLAR, { online: false }));
@@ -342,7 +344,128 @@ test('serving a tray while offline refuses and does not call the API', async (t)
   t.mock.method(axios, 'post', async () => { throw new Error('must not be called'); });
 
   await assert.rejects(
-    () => feeder.setServeTray(2, true),
+    () => feeder.setTrayActive(2, true),
     (err) => err instanceof hap.HapStatusError
   );
+});
+
+
+// --- lid state & tray selection ---------------------------------------
+
+// wetListV3 keyed by `id` (NOT deviceSn -- it answers code 1002
+// "id must not be null" otherwise) reports both values these controls need.
+function mockWetApi(t, state, sink) {
+  t.mock.method(axios, 'post', async (url, body) => {
+    if (sink) sink.push({ url, body });
+    if (/wetListV3$/.test(url)) {
+      return { status: 200, data: { code: 0, data: {
+        platePosition: state.platePosition,
+        manualFeedId: state.manualFeedId
+      } } };
+    }
+    if (/manualFeedNow$/.test(url)) { state.manualFeedId = 999; state.platePosition = body.plate; }
+    if (/stopFeedNow$/.test(url)) { state.manualFeedId = null; }
+    if (/platePositionChange$/.test(url)) {
+      state.platePosition = (state.platePosition % WET_FEEDER_PLATE_COUNT) + 1;
+    }
+    return { status: 200, data: { code: 0 } };
+  });
+}
+
+test('lid reports open exactly when manualFeedId is present', async (t) => {
+  const { platform, hap } = makePlatform();
+  const feeder = new PetLibroWetFeeder(platform, makeStubAccessory(hap), POLAR);
+
+  const state = { platePosition: 2, manualFeedId: 666 };
+  mockWetApi(t, state);
+  assert.equal(await feeder.getLidOpen(), true);
+
+  state.manualFeedId = null;
+  feeder.invalidateWetState();
+  assert.equal(await feeder.getLidOpen(), false);
+});
+
+test('closing the lid calls stopFeedNow with the live feedId', async (t) => {
+  const { platform, hap } = makePlatform();
+  const feeder = new PetLibroWetFeeder(platform, makeStubAccessory(hap), POLAR);
+
+  const state = { platePosition: 2, manualFeedId: 4242 };
+  const calls = [];
+  mockWetApi(t, state, calls);
+
+  await feeder.setLid(false);
+
+  const stop = calls.find(c => /stopFeedNow$/.test(c.url));
+  assert.ok(stop, 'stopFeedNow should have been called');
+  assert.equal(stop.body.feedId, 4242);
+  assert.equal(state.manualFeedId, null);
+});
+
+test('closing an already-closed lid is a no-op', async (t) => {
+  const { platform, hap } = makePlatform();
+  const feeder = new PetLibroWetFeeder(platform, makeStubAccessory(hap), POLAR);
+
+  const state = { platePosition: 1, manualFeedId: null };
+  const calls = [];
+  mockWetApi(t, state, calls);
+
+  await feeder.setLid(false);
+  assert.equal(calls.filter(c => /stopFeedNow$/.test(c.url)).length, 0);
+});
+
+test('opening the lid serves whichever tray is currently in position', async (t) => {
+  const { platform, hap } = makePlatform({ wetPlate: 1 });
+  const feeder = new PetLibroWetFeeder(platform, makeStubAccessory(hap), POLAR);
+
+  // Sitting on tray 3 while the configured default is 1 -- the lid must open
+  // what the user selected, not the default.
+  const state = { platePosition: 3, manualFeedId: null };
+  const calls = [];
+  mockWetApi(t, state, calls);
+
+  await feeder.setLid(true);
+
+  const feed = calls.find(c => /manualFeedNow$/.test(c.url));
+  assert.ok(feed);
+  assert.equal(feed.body.plate, 3);
+});
+
+test('tray switch reflects the live position', async (t) => {
+  const { platform, hap } = makePlatform();
+  const feeder = new PetLibroWetFeeder(platform, makeStubAccessory(hap), POLAR);
+
+  mockWetApi(t, { platePosition: 2, manualFeedId: null });
+
+  assert.equal(await feeder.getTrayActive(1), false);
+  assert.equal(await feeder.getTrayActive(2), true);
+  assert.equal(await feeder.getTrayActive(3), false);
+});
+
+test('selecting a tray rotates to it without opening the lid', async (t) => {
+  const { platform, hap } = makePlatform();
+  const feeder = new PetLibroWetFeeder(platform, makeStubAccessory(hap), POLAR);
+
+  const state = { platePosition: 1, manualFeedId: null };
+  const calls = [];
+  mockWetApi(t, state, calls);
+
+  await feeder.setTrayActive(3, true);
+
+  // 1 -> 3 on a 3-slot tray is two forward steps.
+  assert.equal(calls.filter(c => /platePositionChange$/.test(c.url)).length, 2);
+  assert.equal(state.platePosition, 3);
+  // Selecting must never dispense.
+  assert.equal(calls.filter(c => /manualFeedNow$/.test(c.url)).length, 0);
+  assert.equal(state.manualFeedId, null);
+});
+
+test('switching a tray off is ignored (a position is not a toggle)', async (t) => {
+  const { platform, hap } = makePlatform();
+  const feeder = new PetLibroWetFeeder(platform, makeStubAccessory(hap), POLAR);
+
+  const calls = [];
+  mockWetApi(t, { platePosition: 1, manualFeedId: null }, calls);
+
+  await feeder.setTrayActive(1, false);
+  assert.equal(calls.filter(c => !/wetListV3$/.test(c.url)).length, 0);
 });
