@@ -27,7 +27,7 @@ test('getDeviceType: case-insensitive matching', () => {
 test('getDeviceType: feeder defaults', () => {
   assert.equal(getDeviceType({ productName: 'Granary Smart Feeder', deviceSn: 'PLAF103' }), DEVICE_TYPE.FEEDER);
   assert.equal(getDeviceType({ productName: 'Air Smart Feeder', deviceSn: 'PLAF108' }), DEVICE_TYPE.FEEDER);
-  assert.equal(getDeviceType({ productName: 'Polar Wet Food Feeder', deviceSn: 'PLAF109' }), DEVICE_TYPE.FEEDER);
+  assert.equal(getDeviceType({ productName: 'Granary Smart Camera Feeder', deviceSn: 'AF999002SYNTHETICDRY' }), DEVICE_TYPE.FEEDER);
 });
 
 test('getDeviceType: missing fields default to feeder', () => {
@@ -97,4 +97,43 @@ test('getDeviceType: short 2-char productName like "WF" does NOT trigger fountai
     getDeviceType({ productName: 'Feeder WF Edition', deviceSn: 'AF01' }),
     DEVICE_TYPE.FEEDER
   );
+});
+
+
+// --- Wet feeder (PLAF109 Polar) ---------------------------------------
+// Superseded the old assertion that PLAF109 classified as a plain FEEDER.
+// That classification is what routed the Polar to the dry-feed endpoint and
+// produced API code 2020 on every tap.
+
+test('getDeviceType: PLAF109 productIdentifier -> wet feeder', () => {
+  assert.equal(getDeviceType({ productIdentifier: 'PLAF109' }), DEVICE_TYPE.WET_FEEDER);
+  assert.equal(getDeviceType({ productIdentifier: 'plaf109' }), DEVICE_TYPE.WET_FEEDER);
+  assert.equal(getDeviceType({ product_identifier: 'PLAF109' }), DEVICE_TYPE.WET_FEEDER);
+});
+
+test('getDeviceType: "Polar" product name -> wet feeder (no productIdentifier)', () => {
+  assert.equal(getDeviceType({ productName: 'Polar Wet Food Feeder' }), DEVICE_TYPE.WET_FEEDER);
+  assert.equal(getDeviceType({ productName: 'POLAR' }), DEVICE_TYPE.WET_FEEDER);
+});
+
+test('getDeviceType: real Polar payload shape -> wet feeder', () => {
+  // Field shape as observed on a live PLAF109, firmware 2.0.28.
+  // Serial is synthetic; only the `AF` family-code prefix is real-world shaped.
+  assert.equal(getDeviceType({
+    deviceSn: 'AF999001SYNTHETICPOLAR',
+    productIdentifier: 'PLAF109',
+    productName: 'Polar Wet Food Feeder',
+    online: true
+  }), DEVICE_TYPE.WET_FEEDER);
+});
+
+test('getDeviceType: AF-prefixed dry feeders are NOT misread as wet', () => {
+  // Polar and Granary share the AF serial family, so the serial alone must
+  // never decide this.
+  assert.equal(getDeviceType({ deviceSn: 'AF999002SYNTHETICDRY', productIdentifier: 'PLAF203' }), DEVICE_TYPE.FEEDER);
+  assert.equal(getDeviceType({ deviceSn: 'AF999001SYNTHETICPOLAR' }), DEVICE_TYPE.FEEDER);
+});
+
+test('getDeviceType: fountains still win over wet-feeder checks', () => {
+  assert.equal(getDeviceType({ productName: 'Polar Fountain', deviceSn: 'WF01' }), DEVICE_TYPE.FOUNTAIN);
 });

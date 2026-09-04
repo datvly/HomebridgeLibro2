@@ -2,6 +2,32 @@
 
 All notable user-facing changes to `homebridge-petlibro-2` are documented here. Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-09-04
+
+Adds support for the PLAF109 "Polar" wet food feeder (Wave C of the device-expansion plan). Endpoints and behavior below were verified against live hardware (PLAF109, firmware 2.0.28) rather than inferred — including the finding that the tray-rotation endpoint is a relative step and that re-serving an already-served slot is permitted server-side.
+
+### Fixed
+- **PLAF109 manual feeding never worked.** The Polar was classified as a generic feeder, so taps posted the dry-feeder endpoint `/device/device/manualFeeding` with a `grainNum` portion count. The Polar's firmware does not implement that command: the API answered HTTP 200 with body `{"code": 2020, "msg": "Device response timeout"}` and nothing moved. Wet feeders now post `/device/wetFeedingPlan/manualFeedNow` with a `plate`.
+- **Feed failures reported the HTTP status instead of the API error.** `triggerFeeding` only treated a non-200 HTTP status as failure, so a 200 carrying `code: 2020` fell through to `Feed command failed with status 200` — a message naming a success status and hiding the actual cause. Errors now read `Feed command failed: API code 2020 (Device response timeout)`. Success semantics are unchanged; only the error path gained detail.
+
+### Added
+- **`DEVICE_TYPE.WET_FEEDER` and the `PetLibroWetFeeder` class.** Detection keys on `productIdentifier === 'PLAF109'` with a `productName` containing "Polar" as fallback. Deliberately not serial-prefix based: Polar and Granary serials share the same `AF` family code, so a prefix check cannot separate them.
+- **Standalone tray rotation as a second Switch** on the wet-feeder accessory (subtype `rotate`, labelled "<name> Rotate Tray"). Momentary, like the feed switch. This is not reachable from the official app, which only rotates as a side effect of feeding.
+- **`wetPlate` config** (integer 1-3, default 1) — which tray slot the feed switch serves. Out-of-range and non-numeric values fall back to 1.
+- **`enableTrayRotation` config** (boolean, default true). When set false, an already-cached rotate service is removed from the accessory.
+- **`setPlatePosition(target, current)`** for absolute positioning, built on the relative step primitive: `(target - current) mod 3` calls with a 600 ms cooldown between them, matching the upstream HA integration's pacing. The tray motor drops steps when calls are issued back to back.
+- 15 test cases across `test/device-type.test.js` and the new `test/wet-feeder.test.js`.
+
+### Changed
+- **`assertApiOk` is now the shared response validator** for all device commands, replacing the inline check in `triggerFeeding`.
+- **`getDeviceType` test expectation inverted for PLAF109.** It previously asserted the Polar classified as a plain `FEEDER`; that assertion was pinning the bug.
+
+### Upgrade note
+The accessory UUID seed includes the device type, so a PLAF109 previously cached as `feeder` gets a new UUID as `wet_feeder`. **The old Polar accessory is unregistered and a new one appears**, which means a one-time room reassignment, rename, and re-add to any scenes or automations in Apple Home. Other devices are unaffected.
+
+### Known limitation
+`platePositionChange` advances the tray but does **not** open the lid; opening is `manualFeedNow`. There is no separate lid-open endpoint in the observed API surface. The plan object also exposes `enableFeedAgainWithThaw`, `feedAgainDuration`, and `feedAgainExecutionEndTime`, which appear to control scheduled re-serving; these are unmapped and untouched by this release.
+
 ## [1.5.2] - 2026-06-20
 
 Detection refinement based on the first real-world serial-number data from a v1.5.1 production deployment. No user-visible behavior change for anyone whose devices currently classify correctly; closes a latent misclassification risk for devices whose `productName` lacks fountain keywords.

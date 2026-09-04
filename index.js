@@ -12,7 +12,8 @@ let Service, Characteristic;
 // Device type constants
 const DEVICE_TYPE = {
   FEEDER: 'feeder',
-  FOUNTAIN: 'fountain'
+  FOUNTAIN: 'fountain',
+  WET_FEEDER: 'wet_feeder'
 };
 
 // Fountain identification.
@@ -32,6 +33,17 @@ const FOUNTAIN_NAME_KEYWORDS = ['Dockstream', 'Fountain'];
 // any firmware that does prefix with the marketing code, WF for the
 // observed production format.
 const FOUNTAIN_SERIAL_PREFIXES = ['PLWF', 'WF'];
+
+// Wet-feeder identification (PLAF109 "Polar").
+//
+// Deliberately NOT serial-prefix based: real Polar serials start with the
+// same 2-char `AF` family code as every dry feeder (see the historical note
+// above), so a prefix check cannot separate them. `productIdentifier` is the
+// marketing code carried verbatim in /device/device/list and is the only
+// reliable discriminator observed on production payloads; the name keyword
+// is a fallback for firmware that omits it.
+const WET_FEEDER_PRODUCT_IDENTIFIERS = ['PLAF109'];
+const WET_FEEDER_NAME_KEYWORDS = ['Polar'];
 
 // PetLibro API endpoint. The upstream HA integration (jjjonesjr33/petlibro)
 // ships only the US endpoint, and api.eu.petlibro.com does not resolve
@@ -72,8 +84,61 @@ function getDeviceType(device) {
     if (snUpper.startsWith(prefix.toUpperCase())) return DEVICE_TYPE.FOUNTAIN;
   }
 
+  // Wet feeders are checked before the generic feeder default because they
+  // are a strict subset of "feeder" — they share the AF serial family and
+  // only differ by product code / product name.
+  const productIdentifier = device.productIdentifier || device.product_identifier || '';
+  const pidUpper = productIdentifier.toUpperCase();
+  for (const pid of WET_FEEDER_PRODUCT_IDENTIFIERS) {
+    if (pidUpper === pid.toUpperCase()) return DEVICE_TYPE.WET_FEEDER;
+  }
+  for (const keyword of WET_FEEDER_NAME_KEYWORDS) {
+    if (nameLower.includes(keyword.toLowerCase())) return DEVICE_TYPE.WET_FEEDER;
+  }
+
   // Default to feeder
   return DEVICE_TYPE.FEEDER;
+}
+
+// Number of slots on the Polar's rotating tray. platePositionChange advances
+// exactly one slot per call, so absolute positioning is (target - current)
+// modulo this value.
+const WET_FEEDER_PLATE_COUNT = 3;
+
+// Cooldown between consecutive rotation steps, mirroring the upstream HA
+// integration. The tray motor does not queue commands; firing them back to
+// back drops steps.
+const PLATE_ROTATION_COOLDOWN_MS = 600;
+
+function resolveWetPlate(config) {
+  const raw = parseInt((config && config.wetPlate) || 1, 10);
+  if (!Number.isFinite(raw) || raw < 1 || raw > WET_FEEDER_PLATE_COUNT) return 1;
+  return raw;
+}
+
+// Shared PetLibro response validator.
+//
+// The API answers HTTP 200 even for device-level failures, carrying the real
+// outcome in the body as `code` (0 = success). The previous inline check threw
+// `Feed command failed with status 200`, which named the HTTP status and hid
+// the API code that actually explains the failure — e.g. 2020 "Device response
+// timeout" when a dry-feed command is sent to a wet feeder. Success semantics
+// are unchanged; only the error message gained the code and message.
+function assertApiOk(response, action) {
+  if (response && response.status === 200) {
+    const data = response.data;
+    if (typeof data === 'number' || (data && data.code === 0) || data === 0) return;
+    if (data && typeof data.code !== 'undefined') {
+      const msg = data.msg ? ` (${data.msg})` : '';
+      throw new Error(`${action} failed: API code ${data.code}${msg}`);
+    }
+    throw new Error(`${action} failed: unrecognized API response shape`);
+  }
+  throw new Error(`${action} failed with status ${response ? response.status : 'unknown'}`);
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 class PetLibroPlatform {
@@ -364,6 +429,8 @@ class PetLibroPlatform {
           
           if (deviceType === DEVICE_TYPE.FOUNTAIN) {
             new PetLibroFountain(this, existingAccessory, device);
+          } else if (deviceType === DEVICE_TYPE.WET_FEEDER) {
+            new PetLibroWetFeeder(this, existingAccessory, device);
           } else {
             new PetLibroFeeder(this, existingAccessory, device);
           }
@@ -376,6 +443,8 @@ class PetLibroPlatform {
           
           if (deviceType === DEVICE_TYPE.FOUNTAIN) {
             new PetLibroFountain(this, accessory, device);
+          } else if (deviceType === DEVICE_TYPE.WET_FEEDER) {
+            new PetLibroWetFeeder(this, accessory, device);
           } else {
             new PetLibroFeeder(this, accessory, device);
           }
@@ -434,9 +503,15 @@ class PetLibroFeeder {
       .onGet(this.getOn.bind(this))
       .onSet(this.setOn.bind(this));
     
-    this.log.info(`Initialized feeder: ${this.name} (${this.deviceId})`);
+    this.log.info(`Initialized ${this.deviceLabel}: ${this.name} (${this.deviceId})`);
   }
-  
+
+  // Overridden by subclasses so the constructor's log line names the concrete
+  // device kind instead of every variant announcing itself as a plain feeder.
+  get deviceLabel() {
+    return 'feeder';
+  }
+
   async getOn() {
     // Always return false since this is a momentary switch for feeding
     return false;
@@ -502,16 +577,8 @@ class PetLibroFeeder {
 
     const response = await this.platform.apiPost('/device/device/manualFeeding', feedData, { timeout: 15000 });
 
-    if (response.status === 200) {
-      if (typeof response.data === 'number' ||
-          (response.data && response.data.code === 0) ||
-          response.data === 0) {
-        this.log(`[${this.name}] Manual feeding triggered successfully!`);
-        return;
-      }
-    }
-
-    throw new Error(`Feed command failed with status ${response.status}`);
+    assertApiOk(response, 'Feed command');
+    this.log(`[${this.name}] Manual feeding triggered successfully!`);
   }
   
   generateRequestId() {
@@ -522,6 +589,137 @@ class PetLibroFeeder {
   
   getServices() {
     return [this.informationService, this.switchService];
+  }
+}
+
+// PLAF109 "Polar" wet food feeder.
+//
+// Mechanically unlike the dry feeders: food sits in a 3-slot rotating tray
+// under a lid, so "feed" means "bring the requested slot to the opening and
+// open the lid", not "auger N portions". The dry-feed endpoint is rejected
+// outright — /device/device/manualFeeding answers HTTP 200 with API code 2020
+// ("Device response timeout") because the firmware never replies to a
+// grainNum command. Verified against a live PLAF109 (firmware 2.0.28) on
+// 2026-09-04, alongside these two working endpoints:
+//
+//   /device/wetFeedingPlan/manualFeedNow        {deviceSn, plate}  -> code 0
+//   /device/wetFeedingPlan/platePositionChange  {deviceSn, plate:1} -> code 0
+//
+// platePositionChange advances exactly ONE slot per call regardless of the
+// `plate` value sent; it is a relative step, not a destination. Re-serving an
+// already-served slot returns code 0, so the mobile app's "cannot reopen a
+// used slot" restriction is client-side only and is not enforced here.
+class PetLibroWetFeeder extends PetLibroFeeder {
+  constructor(platform, accessory, device) {
+    super(platform, accessory, device);
+
+    this.plate = resolveWetPlate(this.config);
+
+    const hap = this.platform.api.hap;
+    const rotationEnabled = this.config.enableTrayRotation !== false;
+
+    if (rotationEnabled) {
+      // Second Switch on the same accessory, distinguished by subtype so it
+      // does not collide with the inherited feed switch.
+      this.rotateService = this.accessory.getServiceById(hap.Service.Switch, 'rotate')
+        || this.accessory.addService(hap.Service.Switch, `${this.name} Rotate Tray`, 'rotate');
+
+      this.rotateService.setCharacteristic(hap.Characteristic.Name, `${this.name} Rotate Tray`);
+
+      this.rotateService.getCharacteristic(hap.Characteristic.On)
+        .onGet(async () => false)
+        .onSet(this.setRotate.bind(this));
+    } else {
+      // Config flipped off after the service was already cached — drop it so
+      // HomeKit stops showing a control that no longer does anything.
+      const stale = this.accessory.getServiceById(hap.Service.Switch, 'rotate');
+      if (stale) this.accessory.removeService(stale);
+    }
+
+    this.log.info(`  serving plate ${this.plate}, tray rotation ${rotationEnabled ? 'enabled' : 'disabled'}`);
+  }
+
+  get deviceLabel() {
+    return 'wet feeder';
+  }
+
+  async triggerFeeding() {
+    if (!this.deviceId) {
+      throw new Error('Device ID not found - cannot send feed command');
+    }
+
+    // `portions` is a dry-feeder concept (auger revolutions) and has no
+    // meaning here; the tray slot is the unit of service.
+    this.log(`[${this.name}] Sending wet feed command (plate ${this.plate})`);
+
+    const response = await this.platform.apiPost('/device/wetFeedingPlan/manualFeedNow', {
+      deviceSn: this.deviceId,
+      plate: this.plate,
+      requestId: this.generateRequestId()
+    }, { timeout: 15000 });
+
+    assertApiOk(response, 'Wet feed command');
+    this.log(`[${this.name}] Wet feeding triggered successfully (plate ${this.plate})`);
+  }
+
+  // Advance the tray one slot. Momentary, like the feed switch.
+  async setRotate(value) {
+    if (!value) return;
+
+    const hap = this.platform.api.hap;
+    const reset = (ms) => setTimeout(() => {
+      this.rotateService.getCharacteristic(hap.Characteristic.On).updateValue(false);
+    }, ms);
+
+    if (this.device && this.device.online === false) {
+      this.log.warn(`[${this.name}] Device reports offline; refusing to send rotate command`);
+      reset(100);
+      if (hap.HapStatusError && hap.HAPStatus) {
+        throw new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+      }
+      throw new Error('Device offline');
+    }
+
+    try {
+      await this.rotateTray(1);
+      this.log(`[${this.name}] Tray rotation completed`);
+      reset(1000);
+    } catch (error) {
+      this.log.error(`[${this.name}] Failed to rotate tray:`, error.message);
+      reset(100);
+    }
+  }
+
+  // Advance the tray `steps` slots, one API call per slot.
+  async rotateTray(steps = 1) {
+    if (!this.deviceId) {
+      throw new Error('Device ID not found - cannot send rotate command');
+    }
+
+    for (let i = 0; i < steps; i++) {
+      const response = await this.platform.apiPost('/device/wetFeedingPlan/platePositionChange', {
+        deviceSn: this.deviceId,
+        plate: 1,
+        requestId: this.generateRequestId()
+      }, { timeout: 15000 });
+
+      assertApiOk(response, 'Tray rotation');
+
+      if (i < steps - 1) await delay(PLATE_ROTATION_COOLDOWN_MS);
+    }
+  }
+
+  // Absolute positioning built on the relative step primitive.
+  async setPlatePosition(target, current) {
+    const t = parseInt(target, 10);
+    const c = parseInt(current, 10);
+    if (!Number.isFinite(t) || !Number.isFinite(c)) {
+      throw new Error('setPlatePosition requires numeric target and current positions');
+    }
+    const steps = ((t - c) % WET_FEEDER_PLATE_COUNT + WET_FEEDER_PLATE_COUNT) % WET_FEEDER_PLATE_COUNT;
+    if (steps === 0) return 0;
+    await this.rotateTray(steps);
+    return steps;
   }
 }
 
@@ -665,9 +863,15 @@ module.exports._test = {
   resolveBaseUrl,
   PetLibroPlatform,
   PetLibroFeeder,
+  PetLibroWetFeeder,
   PetLibroFountain,
   DEVICE_TYPE,
   FOUNTAIN_NAME_KEYWORDS,
   FOUNTAIN_SERIAL_PREFIXES,
+  WET_FEEDER_PRODUCT_IDENTIFIERS,
+  WET_FEEDER_NAME_KEYWORDS,
+  WET_FEEDER_PLATE_COUNT,
+  resolveWetPlate,
+  assertApiOk,
   API_REGIONS
 };
